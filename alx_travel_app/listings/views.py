@@ -1,11 +1,19 @@
-from rest_framework import viewsets, permissions
+from rest_framework import viewsets, permissions, status
+from rest_framework.request import Request
+from rest_framework.response import Response
 from rest_framework.exceptions import PermissionDenied
+from rest_framework.views import APIView
 from django_filters.rest_framework import DjangoFilterBackend
 from .models import Listing, Booking, Review
 from django.contrib.auth.models import User
-from .serializers import ListingSerializer, BookingSerializer, ReviewSerializer, UserInfoSerializer
+from .serializers import ListingSerializer, BookingSerializer, ReviewSerializer, UserInfoSerializer, PaymentSerializer
+from .services import ChapaServices 
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
+from django.shortcuts import get_object_or_404
+
+
+
 
 
 class UserViewSet(viewsets.ModelViewSet):
@@ -15,6 +23,8 @@ class UserViewSet(viewsets.ModelViewSet):
 class ListingViewSet(viewsets.ModelViewSet):
     queryset = Listing.objects.all()
     serializer_class = ListingSerializer
+    permission_classes = [permissions.AllowAny]
+    
 
     def get_permissions(self):
         """ Require authenticaion only whe creating/updating listings
@@ -36,8 +46,9 @@ class ListingViewSet(viewsets.ModelViewSet):
 
 
 class BookingViewSet(viewsets.ModelViewSet):
+    queryset = Booking.objects.all()
     serializer_class = BookingSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.AllowAny]
     filter_backends = [DjangoFilterBackend]
     # Displays all bookings for a specific listing
     filterset_fields = ['listing']  # Add the filter for: GET /api/bookings/?listing=<listing_id>
@@ -65,8 +76,13 @@ class BookingViewSet(viewsets.ModelViewSet):
         # Guest sees their own bookings
         return Booking.objects.filter(user=user)
 
-    def perform_create(self, serializer):
+    def perform_create(self, request: Request, serializer, *args, **kwargs):
         # Permission makes sure only the guest can create
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        booking: Booking = serializer.save()
+
         user = self.request.user
         listing = serializer.validated_data['listing']
         days = (serializer.validated_data['end_date'] - serializer.validated_data['start_date']).days + 1
@@ -75,7 +91,29 @@ class BookingViewSet(viewsets.ModelViewSet):
             total_price=listing.price_per_night * days,
             status='pending'
         )
-    
+        
+        #start Chapa payment process here
+        chapa = ChapaServices()
+        response = chapa.initialize_payment(
+            transaction_id=str(booking.booking_id),
+            booking_reference=str(booking.booking_id),
+            amount=float(booking.total_price),
+            email=request.user.email,
+            first_name=request.user.first_name,
+            last_name=request.user.last_name
+        )
+        if response and response.get("status") == "success":
+            payment_url = response["data"]["checkout_url"]
+            return Response(
+                {"payment_url": payment_url},
+                status=status.HTTP_201_CREATED
+            )
+        else:
+            return Response(
+                {"error": "Failed to initialize payment."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )   
+        
     def perform_destroy(self, instance):
         user = self.request.user
         if instance.user != user:
@@ -84,6 +122,95 @@ class BookingViewSet(viewsets.ModelViewSet):
             raise PermissionDenied("Cannot delete a confirmed booking. Set status to canceled instead.")
         instance.delete()
 
+class VerifyPaymentAPIView(APIView):
+    def get(self, request: Request, transaction_id: str, *args, **kwargs):
+        booking = get_object_or_404(Booking, booking_id=transaction_id)
+        chapa = ChapaServices()
+        response = chapa.verify_payment(transaction_id)
+        if response and response.get("status") == "success":
+            payment_data = response["data"]
+            payment_status = payment_data.get("status")
+
+            if payment_status == "successful":
+                booking.status = "confirmed"
+                booking.save()
+                return Response(
+                    {
+                        "message": "Payment verified and booking confirmed.",
+                        "booking_id": str(booking.booking_id),
+                        "status": booking.status
+                    },
+                    status=status.HTTP_200_OK
+                )
+            else:
+                return Response(
+                    {"error": "Payment not successful."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        else:
+            return Response(
+                {"error": "Failed to verify payment."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        
+# class VerifyPaymentAPIView(APIView):
+#     permission_classes = [permissions.IsAuthenticated]
+
+#     @swagger_auto_schema(
+#         responses={
+#             200: openapi.Response(
+#                 description="Payment verified successfully",
+#                 schema=openapi.Schema(
+#                     type=openapi.TYPE_OBJECT,
+#                     properties={
+#                         'message': openapi.Schema(type=openapi.TYPE_STRING),
+#                         'booking_id': openapi.Schema(type=openapi.TYPE_STRING),
+#                         'status': openapi.Schema(type=openapi.TYPE_STRING),
+#                     }
+#                 )
+#             ),
+#             400: "Bad Request",
+#             500: "Internal Server Error"
+#         }
+#     )
+#     def get(self, request: Request, transaction_id: str, *args, **kwargs):
+#         chapa = ChapaServices()
+#         response = chapa.verify_payment(transaction_id)
+
+#         if response and response.get("status") == "success":
+#             payment_data = response["data"]
+#             booking_id = payment_data.get("tx_ref")
+#             payment_status = payment_data.get("status")
+
+#             try:
+#                 booking = Booking.objects.get(booking_id=booking_id)
+#             except Booking.DoesNotExist:
+#                 return Response(
+#                     {"error": "Booking not found."},
+#                     status=status.HTTP_400_BAD_REQUEST
+#                 )
+
+#             if payment_status == "successful":
+#                 booking.status = "confirmed"
+#                 booking.save()
+#                 return Response(
+#                     {
+#                         "message": "Payment verified and booking confirmed.",
+#                         "booking_id": str(booking.booking_id),
+#                         "status": booking.status
+#                     },
+#                     status=status.HTTP_200_OK
+#                 )
+#             else:
+#                 return Response(
+#                     {"error": "Payment not successful."},
+#                     status=status.HTTP_400_BAD_REQUEST
+#                 )
+#         else:
+#             return Response(
+#                 {"error": "Failed to verify payment."},
+#                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
+#             )
 
 class ReviewViewSet(viewsets.ModelViewSet):
     serializer_class = ReviewSerializer
